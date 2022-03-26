@@ -3,25 +3,37 @@ import csv
 from logging import Logger
 import pickle
 from random import Random
-from typing import List, Optional, Set, Tuple, Union
+from typing import List, Set, Tuple, Union
 import os
 
 from rdkit import Chem
 import numpy as np
 from tqdm import tqdm
 
-from .data import MoleculeDatapoint, MoleculeDataset
+from .data import MoleculeDatapoint, MoleculeDataset, make_mols
 from .scaffold import log_scaffold_stats, scaffold_split
 from chemprop.args import PredictArgs, TrainArgs
-from chemprop.features import load_features, load_valid_atom_or_bond_features
+from chemprop.features import load_features, load_valid_atom_or_bond_features, is_mol
+
+def get_header(path: str) -> List[str]:
+    """
+    Returns the header of a data CSV file.
+
+    :param path: Path to a CSV file.
+    :return: A list of strings containing the strings in the comma-separated header.
+    """
+    with open(path) as f:
+        header = next(csv.reader(f))
+
+    return header
 
 
 def preprocess_smiles_columns(path: str,
-                              smiles_columns: Optional[Union[str, List[Optional[str]]]],
-                              number_of_molecules: int = 1) -> List[Optional[str]]:
+                              smiles_columns: Union[str, List[str]] = None,
+                              number_of_molecules: int = 1) -> List[str]:
     """
     Preprocesses the :code:`smiles_columns` variable to ensure that it is a list of column
-    headings corresponding to the columns in the data file holding SMILES.
+    headings corresponding to the columns in the data file holding SMILES. Assumes file has a header.
 
     :param path: Path to a CSV file.
     :param smiles_columns: The names of the columns containing SMILES.
@@ -85,19 +97,6 @@ def get_task_names(path: str,
     return target_names
 
 
-def get_header(path: str) -> List[str]:
-    """
-    Returns the header of a data CSV file.
-
-    :param path: Path to a CSV file.
-    :return: A list of strings containing the strings in the comma-separated header.
-    """
-    with open(path) as f:
-        header = next(csv.reader(f))
-
-    return header
-
-
 def get_data_weights(path: str) -> List[float]:
     """
     Returns the list of data weights for the loss function as stored in a CSV file.
@@ -121,6 +120,7 @@ def get_data_weights(path: str) -> List[float]:
 
 def get_smiles(path: str,
                smiles_columns: Union[str, List[str]] = None,
+               number_of_molecules: int = 1,
                header: bool = True,
                flatten: bool = False
                ) -> Union[List[str], List[List[str]]]:
@@ -130,6 +130,8 @@ def get_smiles(path: str,
     :param path: Path to a CSV file.
     :param smiles_columns: A list of the names of the columns containing SMILES.
                            By default, uses the first :code:`number_of_molecules` columns.
+    :param number_of_molecules: The number of molecules for each data point. Not necessary if
+                                the names of smiles columns are previously processed.
     :param header: Whether the CSV file contains a header.
     :param flatten: Whether to flatten the returned SMILES to a list instead of a list of lists.
     :return: A list of SMILES or a list of lists of SMILES, depending on :code:`flatten`.
@@ -137,15 +139,15 @@ def get_smiles(path: str,
     if smiles_columns is not None and not header:
         raise ValueError('If smiles_column is provided, the CSV file must have a header.')
 
-    if not isinstance(smiles_columns, list):
-        smiles_columns = preprocess_smiles_columns(path=path, smiles_columns=smiles_columns)
+    if not isinstance(smiles_columns, list) and header:
+        smiles_columns = preprocess_smiles_columns(path=path, smiles_columns=smiles_columns, number_of_molecules=number_of_molecules)
 
     with open(path) as f:
         if header:
             reader = csv.DictReader(f)
         else:
             reader = csv.reader(f)
-            smiles_columns = 0
+            smiles_columns = list(range(number_of_molecules))
 
         smiles = [[row[c] for c in smiles_columns] for row in reader]
 
@@ -168,6 +170,59 @@ def filter_invalid_smiles(data: MoleculeDataset) -> MoleculeDataset:
                             and all(m[0].GetNumHeavyAtoms() + m[1].GetNumHeavyAtoms() > 0 for m in datapoint.mol if isinstance(m, tuple))])
 
 
+def get_invalid_smiles_from_file(path: str = None,
+               smiles_columns: Union[str, List[str]] = None,
+               header: bool = True,
+               reaction: bool = False,
+               ) -> Union[List[str], List[List[str]]]:
+    """
+    Returns the invalid SMILES from a data CSV file.
+
+    :param path: Path to a CSV file.
+    :param smiles_columns: A list of the names of the columns containing SMILES.
+                           By default, uses the first :code:`number_of_molecules` columns.
+    :param header: Whether the CSV file contains a header.
+    :param reaction: Boolean whether the SMILES strings are to be treated as a reaction.
+    :return: A list of lists of SMILES, for the invalid SMILES in the file.
+    """
+    smiles = get_smiles(path=path, smiles_columns=smiles_columns, header=header)
+
+    invalid_smiles = get_invalid_smiles_from_list(smiles=smiles, reaction=reaction)
+
+    return invalid_smiles
+
+
+def get_invalid_smiles_from_list(smiles: List[List[str]], reaction: bool = False) -> List[List[str]]:
+    """
+    Returns the invalid SMILES from a list of lists of SMILES strings.
+
+    :param smiles: A list of list of SMILES.
+    :param reaction: Boolean whether the SMILES strings are to be treated as a reaction.
+    :return: A list of lists of SMILES, for the invalid SMILES among the lists provided.
+    """
+    invalid_smiles = []
+
+    # If the first SMILES in the column is a molecule, the remaining SMILES in the same column should all be a molecule.
+    # Similarly, if the first SMILES in the column is a reaction, the remaining SMILES in the same column should all
+    # correspond to reaction. Therefore, get `is_mol_list` only using the first element in smiles.
+    is_mol_list = [is_mol(s) for s in smiles[0]]
+    is_reaction_list = [True if not x and reaction else False for x in is_mol_list]
+    is_explicit_h_list = [False for x in is_mol_list]  # set this to False as it is not needed for invalid SMILES check
+    is_adding_hs_list = [False for x in is_mol_list]  # set this to False as it is not needed for invalid SMILES check
+
+    for mol_smiles in smiles:
+        mols = make_mols(smiles=mol_smiles, reaction_list=is_reaction_list, keep_h_list=is_explicit_h_list,
+                         add_h_list=is_adding_hs_list)
+        if any(s == '' for s in mol_smiles) or \
+           any(m is None for m in mols) or \
+           any(m.GetNumHeavyAtoms() == 0 for m in mols if not isinstance(m, tuple)) or \
+           any(m[0].GetNumHeavyAtoms() + m[1].GetNumHeavyAtoms() == 0 for m in mols if isinstance(m, tuple)):
+
+            invalid_smiles.append(mol_smiles)
+
+    return invalid_smiles
+
+
 def get_data(path: str,
              smiles_columns: Union[str, List[str]] = None,
              target_columns: List[str] = None,
@@ -183,6 +238,7 @@ def get_data(path: str,
              max_data_size: int = None,
              store_row: bool = False,
              logger: Logger = None,
+             loss_function: str = None,
              skip_none_targets: bool = False) -> MoleculeDataset:
     """
     Gets SMILES and target values from a CSV file.
@@ -208,6 +264,7 @@ def get_data(path: str,
     :param store_row: Whether to store the raw CSV row in each :class:`~chemprop.data.data.MoleculeDatapoint`.
     :param skip_none_targets: Whether to skip targets that are all 'None'. This is mostly relevant when --target_columns
                               are passed in, so only a subset of tasks are examined.
+    :param loss_function: The loss function to be used in training.
     :return: A :class:`~chemprop.data.MoleculeDataset` containing SMILES and target values along
              with other info such as additional features when desired.
     """
@@ -226,6 +283,7 @@ def get_data(path: str,
         bond_features_path = bond_features_path if bond_features_path is not None \
             else args.bond_features_path
         max_data_size = max_data_size if max_data_size is not None else args.max_data_size
+        loss_function = loss_function if loss_function is not None else args.loss_function
 
     if not isinstance(smiles_columns, list):
         smiles_columns = preprocess_smiles_columns(path=path, smiles_columns=smiles_columns)
@@ -259,24 +317,41 @@ def get_data(path: str,
     else:
         data_weights = None
 
+    # By default, the targets columns are all the columns except the SMILES column
+    if target_columns is None:
+        target_columns = get_task_names(
+            path=path,
+            smiles_columns=smiles_columns,
+            target_columns=target_columns,
+            ignore_columns=ignore_columns,
+        )
+
+    # Find targets provided as inequalities
+    if loss_function == 'bounded_mse':
+        gt_targets, lt_targets = get_inequality_targets(path=path, target_columns=target_columns)
+    else:
+        gt_targets, lt_targets = None, None
+
     # Load data
     with open(path) as f:
         reader = csv.DictReader(f)
 
-        # By default, the targets columns are all the columns except the SMILES column
-        if target_columns is None:
-            target_columns = get_task_names(
-                path=path,
-                smiles_columns=smiles_columns,
-                target_columns=target_columns,
-                ignore_columns=ignore_columns,
-            )
-
-        all_smiles, all_targets, all_rows, all_features, all_phase_features, all_weights = [], [], [], [], [], []
+        all_smiles, all_targets, all_rows, all_features, all_phase_features, all_weights, all_gt, all_lt = [], [], [], [], [], [], [], []
         for i, row in enumerate(tqdm(reader)):
             smiles = [row[c] for c in smiles_columns]
 
-            targets = [float(row[column]) if row[column] not in ['','nan'] else None for column in target_columns]
+            targets = []
+            for column in target_columns:
+                value = row[column]
+                if value in ['','nan']:
+                    targets.append(None)
+                elif '>' in value or '<' in value:
+                    if loss_function == 'bounded_mse':
+                        targets.append(float(value.strip('<>')))
+                    else:
+                        raise ValueError('Inequality found in target data. To use inequality targets (> or <), the regression loss function bounded_mse must be used.')
+                else:
+                    targets.append(float(value))
 
             # Check whether all targets are None and skip if so
             if skip_none_targets and all(x is None for x in targets):
@@ -293,6 +368,12 @@ def get_data(path: str,
 
             if data_weights is not None:
                 all_weights.append(data_weights[i])
+
+            if gt_targets is not None:
+                all_gt.append(gt_targets[i])
+
+            if lt_targets is not None:
+                all_lt.append(lt_targets[i])
 
             if store_row:
                 all_rows.append(row)
@@ -325,7 +406,9 @@ def get_data(path: str,
                 smiles=smiles,
                 targets=targets,
                 row=all_rows[i] if store_row else None,
-                data_weight=all_weights[i] if data_weights is not None else 1.,
+                data_weight=all_weights[i] if data_weights is not None else None,
+                gt_targets=all_gt[i] if gt_targets is not None else None,
+                lt_targets=all_lt[i] if lt_targets is not None else None,
                 features_generator=features_generator,
                 features=all_features[i] if features_data is not None else None,
                 phase_features=all_phase_features[i] if phase_features is not None else None,
@@ -383,6 +466,25 @@ def get_data_from_smiles(smiles: List[List[str]],
     return data
 
 
+def get_inequality_targets(path: str, target_columns: List[str] = None) -> List[str]:
+    """
+
+    """
+    gt_targets = []
+    lt_targets = []
+
+    with open(path) as f:
+        reader = csv.DictReader(f)
+        for line in reader:
+            values = [line[col] for col in target_columns]
+            gt_targets.append(['>' in val for val in values])
+            lt_targets.append(['<' in val for val in values])
+            if any(['<' in val and '>' in val for val in values]):
+                raise ValueError(f'A target value in csv file {path} contains both ">" and "<" symbols. Inequality targets must be on one edge and not express a range.')
+
+    return gt_targets, lt_targets
+
+
 def split_data(data: MoleculeDataset,
                split_type: str = 'random',
                sizes: Tuple[float, float, float] = (0.8, 0.1, 0.1),
@@ -407,8 +509,8 @@ def split_data(data: MoleculeDataset,
     :return: A tuple of :class:`~chemprop.data.MoleculeDataset`\ s containing the train,
              validation, and test splits of the data.
     """
-    if not (len(sizes) == 3 and sum(sizes) == 1):
-        raise ValueError('Valid split sizes must sum to 1 and must have three sizes: train, validation, and test.')
+    if not (len(sizes) == 3 and np.isclose(sum(sizes), 1)):
+        raise ValueError(f"Invalid train/val/test splits! got: {sizes}")
 
     random = Random(seed)
 
@@ -418,9 +520,6 @@ def split_data(data: MoleculeDataset,
     else:
         folds_file = val_fold_index = test_fold_index = None
     
-    if key_molecule_index >= args.number_of_molecules:
-        raise ValueError('The index provided with the argument `--split_key_molecule` must be less than the number of molecules. Note that this index begins with 0 for the first molecule. ')
-
     if split_type == 'crossval':
         index_set = args.crossval_index_sets[args.seed]
         data_split = []
@@ -472,8 +571,10 @@ def split_data(data: MoleculeDataset,
             raise ValueError('Test size must be zero since test set is created separately '
                              'and we want to put all other data in train and validation')
 
-        assert folds_file is not None
-        assert test_fold_index is not None
+        if folds_file is None:
+            raise ValueError('arg "folds_file" can not be None!')
+        if test_fold_index is None:
+            raise ValueError('arg "test_fold_index" can not be None!')
 
         try:
             with open(folds_file, 'rb') as f:

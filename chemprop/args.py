@@ -13,7 +13,7 @@ from chemprop.data import set_cache_mol, empty_cache
 from chemprop.features import get_available_features_generators
 
 
-Metric = Literal['auc', 'prc-auc', 'rmse', 'mae', 'mse', 'r2', 'accuracy', 'cross_entropy', 'binary_cross_entropy', 'sid', 'wasserstein']
+Metric = Literal['auc', 'prc-auc', 'rmse', 'mae', 'mse', 'r2', 'accuracy', 'cross_entropy', 'binary_cross_entropy', 'sid', 'wasserstein', 'f1', 'mcc', 'bounded_rmse', 'bounded_mae', 'bounded_mse']
 
 
 def get_checkpoint_paths(checkpoint_path: Optional[str] = None,
@@ -228,7 +228,9 @@ class TrainArgs(CommonArgs):
     ignore_columns: List[str] = None
     """Name of the columns to ignore when :code:`target_columns` is not provided."""
     dataset_type: Literal['regression', 'classification', 'multiclass', 'spectra']
-    """Type of dataset. This determines the loss function used during training."""
+    """Type of dataset. This determines the default loss function used during training."""
+    loss_function: Literal['mse', 'bounded_mse', 'binary_cross_entropy','cross_entropy', 'mcc', 'sid', 'wasserstein'] = None
+    """Choice of loss function. Loss functions are limited to compatible dataset types."""
     multiclass_num_classes: int = 3
     """Number of classes when running multiclass classification."""
     separate_val_path: str = None
@@ -246,7 +248,8 @@ class TrainArgs(CommonArgs):
     split_sizes: List[float] = None
     """Split proportions for train/validation/test sets."""
     split_key_molecule: int = 0
-    """The index of the key molecule used for splitting when multiple molecules are present and constrained split_type is used, like scaffold_balanced or random_with_repeated_smiles."""
+    """The index of the key molecule used for splitting when multiple molecules are present and constrained split_type is used, like scaffold_balanced or random_with_repeated_smiles.
+       Note that this index begins with zero for the first molecule."""
     num_folds: int = 1
     """Number of folds when performing cross validation."""
     folds_file: str = None
@@ -309,6 +312,12 @@ class TrainArgs(CommonArgs):
     """Dimensionality of hidden layers in MPN."""
     depth: int = 3
     """Number of message passing steps."""
+    bias_solvent: bool = False
+    """Whether to add bias to linear layers for solvent MPN if :code:`reaction_solvent` is True."""
+    hidden_size_solvent: int = 300
+    """Dimensionality of hidden layers in solvent MPN if :code:`reaction_solvent` is True."""
+    depth_solvent: int = 3
+    """Number of message passing steps for solvent if :code:`reaction_solvent` is True."""
     mpn_shared: bool = False
     """Whether to use the same message passing neural network for all input molecules
     Only relevant if :code:`number_of_molecules > 1`"""
@@ -367,13 +376,19 @@ class TrainArgs(CommonArgs):
     :code:`reac_diff_balance`: concatenates the reactants feature with the difference in features between reactants and products, balances imbalanced reactions. 
     :code:`prod_diff_balance`: concatenates the products feature with the difference in features between reactants and products, balances imbalanced reactions. 
     """
+    reaction_solvent: bool = False
+    """
+    Whether to adjust the MPNN layer to take as input a reaction and a molecule, and to encode them with separate MPNNs.
+    """
     explicit_h: bool = False
     """
-    Whether H are explicitly specified in input (and should be kept this way).
+    Whether H are explicitly specified in input (and should be kept this way). This option is intended to be used
+    with the :code:`reaction` or :code:`reaction_solvent` options, and applies only to the reaction part.
     """
     adding_h: bool = False
     """
-    Whether RDKit molecules will be constructed with adding the Hs to them.
+    Whether RDKit molecules will be constructed with adding the Hs to them. This option is intended to be used
+    with Chemprop's default molecule or multi-molecule encoders, or in :code:`reaction_solvent` mode where it applies to the solvent only.
     """
 
     # Training arguments
@@ -398,8 +413,6 @@ class TrainArgs(CommonArgs):
     """Indicates which function to use in dataset_type spectra training to constrain outputs to be positive."""
     spectra_target_floor: float = 1e-8
     """Values in targets for dataset type spectra are replaced with this value, intended to be a small positive number used to enforce positive values."""
-    alternative_loss_function: Literal['wasserstein'] = None
-    """Option to replace the default loss function, with an alternative. Only currently applied for spectra data type and wasserstein loss."""
     overwrite_default_atom_features: bool = False
     """
     Overwrites the default atom descriptors with the new ones instead of concatenating them.
@@ -441,7 +454,7 @@ class TrainArgs(CommonArgs):
     @property
     def minimize_score(self) -> bool:
         """Whether the model should try to minimize the score metric or maximize it."""
-        return self.metric in {'rmse', 'mae', 'mse', 'cross_entropy', 'binary_cross_entropy', 'sid', 'wasserstein'}
+        return self.metric in {'rmse', 'mae', 'mse', 'cross_entropy', 'binary_cross_entropy', 'sid', 'wasserstein', 'bounded_mse', 'bounded_mae', 'bounded_rmse'}
 
     @property
     def use_input_features(self) -> bool:
@@ -511,6 +524,10 @@ class TrainArgs(CommonArgs):
 
         global temp_save_dir  # Prevents the temporary directory from being deleted upon function return
 
+        #Adapt the number of molecules for reaction_solvent mode
+        if self.reaction_solvent is True and self.number_of_molecules != 2:
+            raise ValueError('In reaction_solvent mode, --number_of_molecules 2 must be specified.')
+
         # Process SMILES columns
         self.smiles_columns = chemprop.data.utils.preprocess_smiles_columns(
             path=self.data_path,
@@ -525,6 +542,14 @@ class TrainArgs(CommonArgs):
                 for key, value in config.items():
                     setattr(self, key, value)
 
+        #Check whether the number of input columns is two for the reaction_solvent mode
+        if self.reaction_solvent is True and len(self.smiles_columns) != 2:
+            raise ValueError(f'In reaction_solvent mode, exactly two smiles column must be provided (one for reactions, and one for molecules)')
+
+        #Validate reaction/reaction_solvent mode
+        if self.reaction is True and self.reaction_solvent is True:
+            raise ValueError('Only reaction or reaction_solvent mode can be used, not both.')
+        
         # Create temporary directory as save directory if not provided
         if self.save_dir is None:
             temp_save_dir = TemporaryDirectory()
@@ -542,19 +567,38 @@ class TrainArgs(CommonArgs):
                 self.metric = 'cross_entropy'
             elif self.dataset_type == 'spectra':
                 self.metric = 'sid'
-            else:
+            elif self.dataset_type == 'regression' and self.loss_function == 'bounded_mse':
+                self.metric = 'bounded_mse'
+            elif self.dataset_type == 'regression':
                 self.metric = 'rmse'
+            else:
+                raise ValueError(f'Dataset type {self.dataset_type} is not supported.')
 
         if self.metric in self.extra_metrics:
             raise ValueError(f'Metric {self.metric} is both the metric and is in extra_metrics. '
                              f'Please only include it once.')
 
         for metric in self.metrics:
-            if not any([(self.dataset_type == 'classification' and metric in ['auc', 'prc-auc', 'accuracy', 'binary_cross_entropy']), 
-                    (self.dataset_type == 'regression' and metric in ['rmse', 'mae', 'mse', 'r2']), 
-                    (self.dataset_type == 'multiclass' and metric in ['cross_entropy', 'accuracy']),
+            if not any([(self.dataset_type == 'classification' and metric in ['auc', 'prc-auc', 'accuracy', 'binary_cross_entropy', 'f1', 'mcc']), 
+                    (self.dataset_type == 'regression' and metric in ['rmse', 'mae', 'mse', 'r2', 'bounded_rmse', 'bounded_mae', 'bounded_mse']), 
+                    (self.dataset_type == 'multiclass' and metric in ['cross_entropy', 'accuracy', 'f1', 'mcc']),
                     (self.dataset_type == 'spectra' and metric in ['sid','wasserstein'])]):
                 raise ValueError(f'Metric "{metric}" invalid for dataset type "{self.dataset_type}".')
+        
+        if self.loss_function is None:
+            if self.dataset_type == 'classification':
+                self.loss_function = 'binary_cross_entropy'
+            elif self.dataset_type == 'multiclass':
+                self.loss_function = 'cross_entropy'
+            elif self.dataset_type == 'spectra':
+                self.loss_function = 'sid'
+            elif self.dataset_type == 'regression':
+                self.loss_function = 'mse'
+            else:
+                raise ValueError(f'Default loss function not configured for dataset type {self.dataset_type}.')
+
+        if self.loss_function != 'bounded_mse' and any(metric in ['bounded_mse', 'bounded_rmse', 'bounded_mae'] for metric in self.metrics):
+            raise ValueError('Bounded metrics can only be used in conjunction with the regression loss function bounded_mse.')
 
         # Validate class balance
         if self.class_balance and self.dataset_type != 'classification':
@@ -679,6 +723,9 @@ class TrainArgs(CommonArgs):
             if min(self.target_weights) < 0:
                 raise ValueError('Provided target weights must be non-negative.')
 
+        # check if key molecule index is outside of the number of molecules
+        if self.split_key_molecule >= self.number_of_molecules:
+            raise ValueError('The index provided with the argument `--split_key_molecule` must be less than the number of molecules. Note that this index begins with 0 for the first molecule. ')
 
 class PredictArgs(CommonArgs):
     """:class:`PredictArgs` includes :class:`CommonArgs` along with additional arguments used for predicting with a Chemprop model."""
